@@ -146,9 +146,10 @@ local function runCompat()
     Compat.results = {}
     local pw, tw = 0, 0
     for _, t in ipairs(tests) do
-        local ok, r = pcall(t[4])
-        if not ok then r = "threw" end
-        table.insert(Compat.results, {name=t[1], cat=t[2], weight=t[3], ok=ok, msg=tostring(r)})
+        local ran, passed, detail = pcall(t[4])
+        local ok = ran and passed == true
+        table.insert(Compat.results, {name=t[1], cat=t[2], weight=t[3], ok=ok,
+            msg=ran and tostring(detail or passed) or ("threw: " .. tostring(passed))})
         tw = tw + t[3]; if ok then pw = pw + t[3] end
         task.wait()
     end
@@ -168,6 +169,7 @@ local function runCompat()
             if r.name == "file I/O" then features.file_io = true end
             if r.name == "debug.getinfo" then features.debug_getinfo = true end
             if r.name == "hookfunction" then features.hookfunction = true end
+            if r.name == "setclipboard" then features.setclipboard = true end
         end
     end
 end
@@ -311,6 +313,7 @@ local FingerprintDB = {
     },
 }
 
+local findings, findingsIndex
 local Fingerprint = {matches = {}, primary = nil, confidence = "low"}
 
 local function scoreFingerprint(fp)
@@ -369,7 +372,7 @@ local function classifyFingerprint()
         local top = Fingerprint.matches[1]
         if top.ratio >= 0.8 and top.matched >= 3 then
             Fingerprint.primary = top
-            Fingerprint.confidence = top.ratio >= 0.9 and "high" or "medium"
+            Fingerprint.confidence = "medium"
         elseif top.ratio >= 0.5 and top.matched >= 2 then
             Fingerprint.primary = top
             Fingerprint.confidence = "medium"
@@ -477,10 +480,10 @@ local currentSession = {
     placeId=game.PlaceId, started=os.time(),
     executor=Executor.name, executorVersion=Executor.version, os=Executor.os,
     compatScore=0, sUNC=sUNC.count .. "/" .. sUNC.total,
-    findingCount=0,
+    findingCount=0, findingsByKey={}, scanComplete=false,
 }
 
-local findings, findingsIndex = {}, {}
+findings, findingsIndex = {}, {}
 local CATEGORIES = {"environment","hooks","remotes","scripts","character","attributes","connections","tags"}
 for _, c in ipairs(CATEGORIES) do findings[c] = {} end
 
@@ -523,6 +526,7 @@ local function push(cat, level, weight, text, extra)
         if not table.find(e.accounts, currentSession.account) then table.insert(e.accounts, currentSession.account) end
     else
         e = {
+            key=key,
             level=level, weight=weight or 0, text=text,
             firstSeen=os.time(), lastSeen=os.time(), count=1,
             sessions={sessionId}, accounts={currentSession.account},
@@ -536,11 +540,13 @@ local function push(cat, level, weight, text, extra)
             if r then findingsIndex[cat .. "|" .. r.text] = nil end
         end
     end
+    currentSession.findingsByKey[key] = {level=e.level, weight=e.weight or 0, category=cat, text=text}
 end
 
 local STORAGE_FOLDER = "ACProbeV7"
 local storagePath
 local sessionHistory = {}
+local Outcomes, Arch
 
 local function getStoragePath()
     if storagePath then return storagePath end
@@ -559,6 +565,7 @@ local function buildSnapshot()
         fs[cat] = {}
         for _, e in ipairs(findings[cat]) do
             table.insert(fs[cat], {
+                key=e.key or (cat .. "|" .. e.text),
                 level=e.level, weight=e.weight, text=e.text,
                 firstSeen=e.firstSeen, lastSeen=e.lastSeen, count=e.count,
                 sessions=e.sessions, accounts=e.accounts,
@@ -651,6 +658,7 @@ local function mergeLoaded(loaded)
                             if (SEV[e.level] or 0) > (SEV[ex.level] or 0) then ex.level = e.level end
                         else
                             local entry = {
+                                key=key,
                                 level=e.level or "info", weight=e.weight or 0, text=e.text,
                                 firstSeen=e.firstSeen or os.time(), lastSeen=e.lastSeen or os.time(),
                                 count=e.count or 1, sessions=e.sessions or {}, accounts=e.accounts or {},
@@ -677,7 +685,7 @@ end
 -- ============================================================
 -- NEW: Outcome tracer — what does the server do after a suspicious fire?
 -- ============================================================
-local Outcomes = {
+Outcomes = {
     entries = {},  -- array of {remote, at, deltas...}
     active = {},   -- remoteName -> {startT, baseline, monitorThread}
     monitorSeconds = 4,
@@ -785,7 +793,8 @@ end
 -- ============================================================
 local Profiler = {
     window = 60, stateWindow = 200,
-    remotes = {}, states = {}, lastState = nil, installed = false,
+    remotes = {}, states = {}, lastState = nil, installed = false, active = false,
+    hook = nil, original = nil, errors = 0,
 }
 
 local function getState()
@@ -867,11 +876,12 @@ local function recordCall(remoteName, method, args, caller)
     local cur, prev = snapState()
     if prev and cur then
         for _, field in ipairs({"pos","hp","ws","jp","hh","state"}) do
+            local c = p.corr[field] or {matched=0, total=0}
+            c.total = c.total + 1
             if diffState(prev, cur, field) then
-                local c = p.corr[field] or {matched=0, total=0}
                 c.matched = c.matched + 1
-                p.corr[field] = c
             end
+            p.corr[field] = c
         end
     end
 end
@@ -898,31 +908,54 @@ local function installProfilerHook()
     local ok, mt = pcall(getrawmt, game)
     if not ok or not mt then return end
     local old = mt.__namecall
-    pcall(setreadonly, mt, false)
-    mt.__namecall = newcclosure(function(self, ...)
-        local m = getnamecallmethod()
-        if m == "FireServer" or m == "InvokeServer" then
-            local nm = "?"
-            pcall(function() nm = self.Name end)
+    if type(old) ~= "function" then return end
+    local hook = newcclosure(function(self, ...)
+        if Profiler.active then
             local args = table.pack(...)
-            local caller = callstackTrace()
-            recordCall(nm, m, args, caller)
-        elseif m == "Kick" and self == player then
-            currentSession.endReason = "kicked"
-            currentSession.kickMessage = tostring((select(1, ...)) or "")
-            currentSession.ended = os.time()
-            saveNow()
+            local recorded = pcall(function()
+                local m = getnamecallmethod()
+                if m == "FireServer" or m == "InvokeServer" then
+                    local nm = "?"
+                    pcall(function() nm = self.Name end)
+                    recordCall(nm, m, args, callstackTrace())
+                elseif m == "Kick" and self == player then
+                    currentSession.endReason = "kicked"
+                    currentSession.kickMessage = tostring(args[1] or "")
+                    currentSession.ended = os.time()
+                    saveNow()
+                end
+            end)
+            if not recorded then Profiler.errors = Profiler.errors + 1 end
         end
         return old(self, ...)
     end)
+    local unlocked = pcall(setreadonly, mt, false)
+    if not unlocked then return end
+    local assigned = pcall(function() mt.__namecall = hook end)
     pcall(setreadonly, mt, true)
+    if not assigned then return end
+    Profiler.hook, Profiler.original = hook, old
     Profiler.installed = true
+end
+
+local function detachProfilerHook()
+    Profiler.active = false
+    if not Profiler.installed then return true end
+    local ok, mt = pcall(getrawmt, game)
+    if not ok or not mt or mt.__namecall ~= Profiler.hook then return false end
+    if not pcall(setreadonly, mt, false) then return false end
+    local restored = pcall(function() mt.__namecall = Profiler.original end)
+    pcall(setreadonly, mt, true)
+    if restored then
+        Profiler.installed, Profiler.hook, Profiler.original = false, nil, nil
+    end
+    return restored
 end
 
 -- ============================================================
 -- Architecture classifier
 -- ============================================================
-local Arch = {classification="None detected", confidence="low", reasons={}}
+Arch = {classification="No signals observed", confidence="low", reasons={}}
 
 local function classifyArch()
     local hooks, conns, remotes, sources, correlated = 0, 0, 0, 0, 0
@@ -942,15 +975,15 @@ local function classifyArch()
     if remotes > 0 then score = score + 1; table.insert(Arch.reasons, remotes .. " name-matched remote(s)") end
     if correlated > 0 then score = score + 3; table.insert(Arch.reasons, correlated .. " behavioral correlation(s)") end
     if sources > 0 then score = score + 2; table.insert(Arch.reasons, sources .. " source match(es)") end
-    if score == 0 then Arch.classification, Arch.confidence = "None detected", "high"
+    if score == 0 then Arch.classification, Arch.confidence = "No signals observed", "low"
     elseif hooks > 0 or sources > 0 then
-        Arch.classification, Arch.confidence = "Client-side (custom)", score >= 6 and "high" or "medium"
+        Arch.classification, Arch.confidence = "Client-side signals", score >= 6 and "medium" or "low"
     elseif conns > 0 then
-        Arch.classification, Arch.confidence = "Client-side (behavioral)", score >= 4 and "high" or "medium"
+        Arch.classification, Arch.confidence = "Client-side signals", "low"
     elseif correlated > 0 then
-        Arch.classification, Arch.confidence = "Server-side (validated remotes)", "medium"
+        Arch.classification, Arch.confidence = "Remote/state co-occurrence", "low"
     elseif remotes > 0 then
-        Arch.classification, Arch.confidence = "Server-side (endpoints)", "low"
+        Arch.classification, Arch.confidence = "Name-matched remotes", "low"
     else
         Arch.classification, Arch.confidence = "Undetermined", "low"
     end
@@ -968,12 +1001,11 @@ local function generateRecommendations()
     if Fingerprint.primary then
         table.insert(Recommendations.items, {
             priority = "high",
-            text = "Detected: " .. Fingerprint.primary.name ..
+            text = "Possible fingerprint: " .. Fingerprint.primary.name ..
                    " (" .. string.format("%.0f%%", Fingerprint.primary.ratio*100) .. " marker match)",
         })
-        for _, line in ipairs({Fingerprint.primary.fp.recommendation}) do
-            table.insert(Recommendations.items, {priority="info", text=line})
-        end
+        table.insert(Recommendations.items, {priority="info",
+            text="Keyword matches can overlap across systems. Inspect the matching evidence before drawing conclusions."})
     end
 
     -- From outcomes
@@ -986,16 +1018,16 @@ local function generateRecommendations()
         end
     end
     if movementOutcome then
-        table.insert(Recommendations.items, {priority="high", text="Movement reset observed — the AC actively reverts movement. Test in increments: WS 20, 24, 28, 30, 32. Stop at first kick or reset."})
+        table.insert(Recommendations.items, {priority="high", text="Movement changed near a monitored call. The cause is unverified; inspect the timeline before attributing it."})
     end
     if positionOutcome then
-        table.insert(Recommendations.items, {priority="high", text="Position teleport-back observed — hard position validation. Direct CFrame sets are unsafe. Use WalkSpeed/HipHeight only, or avoid position manipulation."})
+        table.insert(Recommendations.items, {priority="high", text="Large position change observed near a monitored call. Check whether normal movement, a respawn, or a reset explains it."})
     end
     if kickOutcome then
-        table.insert(Recommendations.items, {priority="fail", text="Kick observed — one probe already triggered the ban/kick threshold. Do not repeat this probe or any probe above it."})
+        table.insert(Recommendations.items, {priority="fail", text="Kick observed. Its cause and any server-side action require separate evidence."})
     end
     if #Outcomes.entries > 0 and not (movementOutcome or positionOutcome or kickOutcome) then
-        table.insert(Recommendations.items, {priority="info", text="Suspicious remotes fired but no client-visible consequence was observed. Likely server-side logging only — the AC reports but does not revert."})
+        table.insert(Recommendations.items, {priority="info", text="No client-visible consequence was captured in the observation window. Server-side behavior is unknown."})
     end
 
     -- From stealth
@@ -1004,10 +1036,10 @@ local function generateRecommendations()
     end
 
     -- From architecture
-    if Arch.classification == "Client-side (custom)" then
-        table.insert(Recommendations.items, {priority="info", text="Client-side AC observed. Hook detection is the primary risk. Verify Stealth tab before probing further."})
-    elseif Arch.classification == "Server-side (validated remotes)" then
-        table.insert(Recommendations.items, {priority="info", text="Server-side validation only. Client hooks are safe; match expected remote argument shape exactly."})
+    if Arch.classification == "Client-side signals" then
+        table.insert(Recommendations.items, {priority="info", text="Client-side signals found. Review the matched hooks and source before assigning an owner."})
+    elseif Arch.classification == "Remote/state co-occurrence" then
+        table.insert(Recommendations.items, {priority="info", text="Remote calls and state changes co-occurred. This does not establish validation or causation."})
     end
 
     -- From behavioral
@@ -1017,7 +1049,7 @@ local function generateRecommendations()
                 if c.total > 0 and c.matched / c.total >= 0.7 and c.matched >= 3 then
                     local label = (field == "ws" and "WalkSpeed") or (field == "jp" and "JumpPower")
                         or (field == "hh" and "HipHeight") or (field == "pos" and "position") or field
-                    table.insert(Recommendations.items, {priority="info", text=string.format("'%s' validates %s (%d/%d correlation). This is the remote to study for the %s threshold.", name, label, c.matched, c.total, label)})
+                    table.insert(Recommendations.items, {priority="info", text=string.format("'%s' co-occurred with %s changes (%d/%d sampled calls). Inspect timing and ordinary gameplay before attribution.", name, label, c.matched, c.total)})
                 end
             end
         end
@@ -1119,7 +1151,7 @@ local function probe_hooks()
                         local dsrc = safe(decompile, fn)
                         if dsrc then
                             local kw = anyMatch(dsrc, SIG.source)
-                            if kw then attributed, weight = "confirmed AC (source matched '" .. kw .. "')", 30 end
+                            if kw then attributed, weight = "source keyword matched '" .. kw .. "'", 12 end
                         end
                     end
                     push("hooks", weight >= 20 and "fail" or (weight >= 5 and "warn" or "info"),
@@ -1191,7 +1223,7 @@ local function probe_scripts()
                                 local kw2 = anyMatch(fnSrc, SIG.source)
                                 if kw2 then
                                     srcHits = srcHits + 1
-                                    push("scripts", "fail", 12,
+                                    push("scripts", "warn", 8,
                                         string.format("'%s' source matched '%s' at %s", d.Name, kw2, path),
                                         {scriptPath = path})
                                 end
@@ -1404,7 +1436,7 @@ tabLayout.FillDirection = Enum.FillDirection.Horizontal
 tabLayout.Padding = UDim.new(0, 3)
 tabLayout.Parent = tabBar
 
-local tabs = {"Recs","Overview","Outcomes","Detections","Probes","Live","Stealth","Test","Fingerprint"}
+local tabs = {"Recs","Overview","Changes","Outcomes","Detections","Probes","Live","Stealth","Test","Fingerprint"}
 local tabButtons, tabContents = {}, {}
 
 local contentHolder = Instance.new("Frame")
@@ -1416,7 +1448,7 @@ contentHolder.Parent = main
 local function makeTab(name)
     local b = Instance.new("TextButton")
     b.Text = name
-    b.Size = UDim2.new(0, 92, 1, 0)
+    b.Size = UDim2.new(0, 89, 1, 0)
     b.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
     b.TextColor3 = Color3.fromRGB(200, 200, 210)
     b.Font = Enum.Font.GothamSemibold
@@ -1475,12 +1507,13 @@ end
 
 local runBtn    = makeButton("Run All",   0.14, -2, Color3.fromRGB(40, 120, 80));  runBtn.Position    = UDim2.new(0,    0, 0, 0)
 local probeBtn  = makeButton("Probe",     0.11, -2, Color3.fromRGB(180, 120, 40)); probeBtn.Position  = UDim2.new(0.14, 2, 0, 0)
-local liveBtn   = makeButton("Live: Off", 0.12, -2, Color3.fromRGB(45, 45, 55));   liveBtn.Position   = UDim2.new(0.25, 4, 0, 0)
+local liveBtn   = makeButton("Live: Paused", 0.12, -2, Color3.fromRGB(45, 45, 55)); liveBtn.Position   = UDim2.new(0.25, 4, 0, 0)
 local exportBtn = makeButton("JSON",      0.10, -2, Color3.fromRGB(45, 100, 150));  exportBtn.Position = UDim2.new(0.37, 6, 0, 0)
 local wipeBtn   = makeButton("Wipe",      0.10, -2, Color3.fromRGB(100, 50, 50));   wipeBtn.Position   = UDim2.new(0.47, 8, 0, 0)
 local closeBtn  = makeButton("Close",     0.10, -2, Color3.fromRGB(120, 50, 50));   closeBtn.Position  = UDim2.new(0.88, 14, 0, 0)
 
 -- Render helpers
+local AutoProbe
 local levels = {
     ok={icon="✓",color=Color3.fromRGB(80,200,120)}, info={icon="•",color=Color3.fromRGB(140,160,210)},
     warn={icon="!",color=Color3.fromRGB(230,180,80)}, fail={icon="✗",color=Color3.fromRGB(230,90,90)},
@@ -1567,24 +1600,20 @@ end
 
 local function scoreAll()
     local t = 0
-    for _, list in pairs(findings) do
+    for cat, list in pairs(findings) do
         for _, f in ipairs(list) do
-            local key = "?"
-            for c, l in pairs(findings) do
-                for _, e in ipairs(l) do if e == f then key = c .. "|" .. f.text break end end
-                if key ~= "?" then break end
-            end
+            local key = f.key or (cat .. "|" .. f.text)
             if not Baseline[key] then t = t + (f.weight or 0) end
         end
     end
     return math.min(100, t)
 end
 local function threatBand(s)
-    if s < 15 then return "Clean", Color3.fromRGB(80,200,120)
-    elseif s < 35 then return "Minor", Color3.fromRGB(90,160,230)
-    elseif s < 60 then return "Moderate", Color3.fromRGB(230,190,80)
-    elseif s < 85 then return "Heavy", Color3.fromRGB(230,130,70)
-    else return "Aggressive", Color3.fromRGB(230,80,80) end
+    if s < 15 then return "No signals", Color3.fromRGB(80,200,120)
+    elseif s < 35 then return "Low signals", Color3.fromRGB(90,160,230)
+    elseif s < 60 then return "Some signals", Color3.fromRGB(230,190,80)
+    elseif s < 85 then return "Many signals", Color3.fromRGB(230,130,70)
+    else return "Numerous signals", Color3.fromRGB(230,80,80) end
 end
 
 local function renderRecommendations()
@@ -1599,7 +1628,7 @@ local function renderRecommendations()
         addRow("Recs", lvl, r.text)
     end
     addHeader("Recs", "Quick actions")
-    addRow("Recs", "info", "→ Probe tab: click Probe to test state changes (safe, auto-reverts)")
+    addRow("Recs", "info", "→ Probe tab: click Probe to test state changes (restores saved properties)")
     addRow("Recs", "info", "→ Stealth tab: verify your hook isn't visible before probing further")
     addRow("Recs", "info", "→ Detections tab: click any finding to mark baseline/confirmed_ac")
 end
@@ -1659,11 +1688,58 @@ local function renderOverview()
     end
 end
 
+local function renderComparison()
+    addHeader("Changes", "Current session vs previous saved session")
+    if not currentSession.scanComplete then
+        addRow("Changes", "skip", "Run All must complete before comparing sessions")
+        return
+    end
+    local previous
+    for _, session in ipairs(sessionHistory) do
+        if type(session.findingsByKey) == "table" and session.scanComplete and
+           (not previous or (session.started or 0) > (previous.started or 0)) then
+            previous = session
+        end
+    end
+    if not previous then
+        addRow("Changes", "skip", "No compatible previous session. Run once more after rejoining to compare.")
+        return
+    end
+    local old = previous.findingsByKey
+    local now = currentSession.findingsByKey
+    local changes = {}
+    for key, entry in pairs(now) do
+        local prior = old[key]
+        if not prior then
+            changes[#changes+1] = {kind="New", level="warn", key=key, entry=entry}
+        elseif prior.level ~= entry.level or prior.weight ~= entry.weight then
+            changes[#changes+1] = {kind="Changed", level="info", key=key, entry=entry,
+                meta=string.format("%s/%s → %s/%s", prior.level or "?", prior.weight or 0,
+                    entry.level or "?", entry.weight or 0)}
+        end
+    end
+    for key, entry in pairs(old) do
+        if not now[key] then changes[#changes+1] = {kind="Absent", level="info", key=key, entry=entry} end
+    end
+    table.sort(changes, function(a, b) return a.key < b.key end)
+    addRow("Changes", "info", string.format("Previous: %s · %d change(s)",
+        os.date("%Y-%m-%d %H:%M", previous.started or os.time()), #changes))
+    if #changes == 0 then addRow("Changes", "ok", "No differences in recorded findings") end
+    for i = 1, math.min(80, #changes) do
+        local change = changes[i]
+        addRow("Changes", change.level,
+            string.format("%s [%s] %s", change.kind, change.entry.category or "?",
+                change.entry.text or change.key), change.meta)
+    end
+    if #changes > 80 then addRow("Changes", "info", string.format("%d more changes omitted", #changes - 80)) end
+    addRow("Changes", "info", "Absent means not observed this session; it does not prove removal.")
+end
+
 local function renderOutcomes()
     addHeader("Outcomes", string.format("%d outcome(s) captured", #Outcomes.entries))
     if #Outcomes.entries == 0 then
         addRow("Outcomes", "skip", "No outcomes yet — enable Live and let the AC react to normal play")
-        addRow("Outcomes", "info", "Outcomes capture what the SERVER does after a suspicious remote fires.")
+        addRow("Outcomes", "info", "Outcomes record client-visible changes near a remote call; cause is unknown.")
         addRow("Outcomes", "info", "Watch for: teleport-back, WalkSpeed reset, HP drop, kick, GUI change.")
         return
     end
@@ -1679,6 +1755,7 @@ local function renderOutcomes()
     end
 end
 
+local renderAll
 local function renderDetections()
     local cats = {"remotes", "connections", "attributes", "tags", "character", "environment"}
     local all = {}
@@ -1729,7 +1806,7 @@ local function renderProbes()
     if #AutoProbe.results == 0 then
         addRow("Probes", "skip", "No probes run yet — click Probe button")
         addRow("Probes", "info", "Each probe: set state → wait 2s → observe → revert")
-        addRow("Probes", "info", "Remotes that fire ONLY during a specific probe are causally linked.")
+        addRow("Probes", "info", "Remote counts are observations; unrelated events can occur during a probe.")
         return
     end
     for _, r in ipairs(AutoProbe.results) do
@@ -1741,6 +1818,8 @@ end
 
 local function renderLive()
     addHeader("Live", "Behavioral profiles + callstack")
+    addRow("Live", "info", string.format("Hook: %s · recording: %s · profiler errors: %d",
+        Profiler.installed and "attached" or "unavailable", Profiler.active and "on" or "paused", Profiler.errors))
     local sorted = {}
     for _, p in pairs(Profiler.remotes) do if p.calls >= 1 then sorted[#sorted+1] = p end end
     table.sort(sorted, function(a, b) return a.calls > b.calls end)
@@ -1768,9 +1847,9 @@ local function renderLive()
 end
 
 local function renderStealth()
-    addHeader("Stealth", string.format("Score: %d/%d — %s",
+    addHeader("Stealth", string.format("Local checks: %d/%d — %s",
         Stealth.score, Stealth.total,
-        (Stealth.total > 0 and Stealth.score / Stealth.total >= 0.7) and "good" or "DETECTABLE"))
+        (Stealth.total > 0 and Stealth.score / Stealth.total >= 0.7) and "few flags" or "review flags"))
     if #Stealth.tests == 0 then
         addRow("Stealth", "skip", "No stealth tests run")
         return
@@ -1782,7 +1861,7 @@ local function renderStealth()
     addHeader("Stealth", "Why this matters")
     addRow("Stealth", "info", "If __namecall is a Lua function with ACProbe-named upvalues,")
     addRow("Stealth", "info", "the AC can identify and target your hook.")
-    addRow("Stealth", "info", "newcclosure() + clean upvalue names is standard mitigation.")
+    addRow("Stealth", "info", "These checks do not establish whether a game detects the hook.")
 end
 
 local function renderTest()
@@ -1803,7 +1882,7 @@ local function renderTest()
 end
 
 local function renderFingerprint()
-    addHeader("Fingerprint", "Known AC matches (weighted marker scoring)")
+    addHeader("Fingerprint", "Candidate matches (name and keyword markers)")
     if #Fingerprint.matches == 0 then
         addRow("Fingerprint", "skip", "No fingerprint matches yet — run Run All first")
         return
@@ -1815,16 +1894,13 @@ local function renderFingerprint()
         for _, hit in ipairs(m.hits) do
             addRow("Fingerprint", "info", "  · " .. hit)
         end
-        if m.ratio >= 0.5 then
-            addRow("Fingerprint", "info", "  Rec: " .. m.fp.recommendation)
-        end
     end
     addHeader("Fingerprint", "How it works")
-    addRow("Fingerprint", "info", "Each known AC has weighted markers: remote names, script names,")
-    addRow("Fingerprint", "info", "decompiled-source keywords, global names. Hit ≥80% = high confidence.")
+    addRow("Fingerprint", "info", "Markers include remote names, script names, source keywords and globals.")
+    addRow("Fingerprint", "info", "Generic keywords overlap; matches are leads, not identifications.")
 end
 
-local function renderAll()
+renderAll = function()
     orderCounter = 0
     for _, t in ipairs(tabs) do clearTab(t) end
     classifyArch()
@@ -1834,6 +1910,7 @@ local function renderAll()
         Executor.name, Executor.os, sUNC.count, sUNC.total, Compat.score)
     renderRecommendations()
     renderOverview()
+    renderComparison()
     renderOutcomes()
     renderDetections()
     renderProbes()
@@ -1846,7 +1923,7 @@ end
 -- ============================================================
 -- AutoProbe (safe defaults; risky probes stay disabled unless toggled)
 -- ============================================================
-local AutoProbe = {results = {}, running = false, riskyEnabled = false}
+AutoProbe = {results = {}, running = false, riskyEnabled = false}
 
 local function snapshotCounts()
     local c = {}
@@ -1860,11 +1937,15 @@ local function probeOne(name, setup, teardown, waitSec, risky)
     end
     local before = snapshotCounts()
     local okS, errS = pcall(setup)
-    if not okS then pcall(teardown); return {name=name, level="fail", msg="setup: " .. tostring(errS)} end
+    if not okS then
+        local restored, restoreErr = pcall(teardown)
+        return {name=name, level="fail", msg="setup: " .. tostring(errS) ..
+            (restored and " (restored)" or ("; restore: " .. tostring(restoreErr)))}
+    end
     local t0 = os.clock()
     while os.clock() - t0 < (waitSec or 2) do task.wait(0.05) end
     local after = snapshotCounts()
-    pcall(teardown)
+    local restored, restoreErr = pcall(teardown)
     local fired = {}
     for rn, c in pairs(after) do
         if c > (before[rn] or 0) then fired[rn] = c - (before[rn] or 0) end
@@ -1875,8 +1956,9 @@ local function probeOne(name, setup, teardown, waitSec, risky)
     local count = 0
     for _, c in pairs(fired) do count = count + c end
     return {
-        name=name, level=count > 0 and "warn" or "ok",
-        msg=count > 0 and ("remotes: " .. table.concat(summary, ", ")) or "no remotes fired",
+        name=name, level=not restored and "fail" or (count > 0 and "warn" or "ok"),
+        msg=(count > 0 and ("remotes: " .. table.concat(summary, ", ")) or "no remotes observed") ..
+            (restored and "" or ("; restore failed: " .. tostring(restoreErr))),
         fired=fired, count=count, risky=risky,
     }
 end
@@ -1942,15 +2024,19 @@ local function runAutoProbes()
     task.wait(0.5)
 
     if AutoProbe.riskyEnabled then
+        local originalCollision = {}
         local p5 = probeOne("Noclip 2s",
             function()
                 for _, d in ipairs(char:GetDescendants()) do
-                    if d:IsA("BasePart") then d.CanCollide = false end
+                    if d:IsA("BasePart") then
+                        originalCollision[d] = d.CanCollide
+                        d.CanCollide = false
+                    end
                 end
             end,
             function()
-                for _, d in ipairs(char:GetDescendants()) do
-                    if d:IsA("BasePart") and d.Name ~= "HumanoidRootPart" then d.CanCollide = true end
+                for part, original in pairs(originalCollision) do
+                    if part.Parent then part.CanCollide = original end
                 end
             end, 2, true)
         table.insert(AutoProbe.results, p5)
@@ -1981,14 +2067,20 @@ local probes = {
 local function runAll()
     if running then return end
     running = true
+    local scanOk = true
     for i, p in ipairs(probes) do
         titleLabel.Text = string.format("  Anticheat Probe v7 — %d/%d: %s", i, #probes, p[1])
         local ok, err = pcall(p[2])
-        if not ok then push(p[1], "fail", 5, "Crashed: " .. tostring(err)) end
+        if not ok then
+            scanOk = false
+            push(p[1], "fail", 5, "Crashed: " .. tostring(err))
+        end
         saveNow()
         task.wait()
     end
+    currentSession.scanComplete = scanOk
     runStealth()
+    saveNow()
     renderAll()
     titleLabel.Text = "  Anticheat Probe v7"
     running = false
@@ -1997,8 +2089,13 @@ end
 local liveOn = false
 local function startLive()
     if liveOn then return end
-    liveOn = true
     installProfilerHook()
+    if not Profiler.installed then
+        liveBtn.Text = "Hook unavailable"
+        return
+    end
+    liveOn = true
+    Profiler.active = true
     snapState()
     task.spawn(function()
         while liveOn do
@@ -2013,13 +2110,16 @@ local function startLive()
 end
 local function stopLive()
     liveOn = false
-    liveBtn.Text = "Live: Off"
+    Profiler.active = false
+    liveBtn.Text = "Live: Paused"
     liveBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
 end
 
 runBtn.MouseButton1Click:Connect(runAll)
 probeBtn.MouseButton1Click:Connect(function()
     if AutoProbe.running then return end
+    if not liveOn then startLive() end
+    if not liveOn then return end
     task.spawn(runAutoProbes)
 end)
 liveBtn.MouseButton1Click:Connect(function() if liveOn then stopLive() else startLive() end end)
@@ -2061,7 +2161,10 @@ wipeBtn.MouseButton1Click:Connect(function()
     end)
 end)
 closeBtn.MouseButton1Click:Connect(function()
-    saveNow(); screenGui:Destroy()
+    stopLive()
+    saveNow()
+    if detachProfilerHook() and getgenv then getgenv().ACProbeV7Loaded = nil end
+    screenGui:Destroy()
 end)
 
 -- ============================================================
