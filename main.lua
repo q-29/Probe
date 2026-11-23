@@ -1,16 +1,57 @@
--- Anticheat Probe v7 — outcome tracing, AC fingerprinting, stealth, recommendations.
--- Read-only except for explicit Probe button. Outcomes capture client-visible consequences.
+-- Anticheat Probe v7 — client-side diagnostics for authorized test environments.
+-- Read-only by default. Live observation and temporary character probes require explicit action.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local CollectionService = game:GetService("CollectionService")
 local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
 local player = Players.LocalPlayer
 
-local SCHEMA = 7
-if getgenv and getgenv().ACProbeV7Loaded then return end
-if getgenv then getgenv().ACProbeV7Loaded = true end
+local SCHEMA = 8
+local LEGACY_SCHEMA = 7
+local function safe(fn, ...)
+    local ok, result = pcall(fn, ...)
+    if ok then return result end
+    return nil
+end
+local globalEnv = type(getgenv) == "function" and safe(getgenv) or nil
+local function hasExistingProbeGui()
+    local roots = {}
+    local function addRoot(root) if root then roots[#roots+1] = root end end
+    if type(gethui) == "function" then addRoot(safe(gethui)) end
+    addRoot(safe(function() return game:GetService("CoreGui") end))
+    addRoot(safe(function() return player:FindFirstChildOfClass("PlayerGui") end))
+    if #roots == 0 then return nil end
+    local failed = false
+    for _, root in ipairs(roots) do
+        local children = safe(function() return root:GetChildren() end)
+        if type(children) ~= "table" then
+            failed = true
+        else
+            for _, child in ipairs(children) do
+                local name = safe(function() return child.Name end)
+                if type(name) == "string" and name:sub(1, #"ACProbeV7_") == "ACProbeV7_" then return true end
+            end
+        end
+    end
+    if failed then return nil end
+    return false
+end
+local existingGuard = type(globalEnv) == "table" and globalEnv.ACProbeV7Loaded or nil
+if type(existingGuard) == "table" and existingGuard.active == true then return end
+if existingGuard == true then
+    local hasGui = hasExistingProbeGui()
+    if hasGui ~= false then return end
+    pcall(function() globalEnv.ACProbeV7Loaded = nil end)
+end
+local loadedMarker = {active=true, startedAt=os.time()}
+local function clearLoadedGuard()
+    if type(globalEnv) == "table" and globalEnv.ACProbeV7Loaded == loadedMarker then
+        pcall(function() globalEnv.ACProbeV7Loaded = nil end)
+    end
+end
 
 -- ============================================================
 -- Primitives
@@ -20,7 +61,6 @@ local newcclosure       = newcclosure or function(f) return f end
 local setclipboard      = setclipboard or toclipboard or (syn and syn.write_clipboard)
 local getnamecallmethod = getnamecallmethod or function() return nil end
 local decompile         = decompile or (syn and syn.decompile)
-local function safe(fn, ...) local ok, r = pcall(fn, ...) return ok and r or nil end
 
 -- ============================================================
 -- Executor identity (compact)
@@ -29,16 +69,20 @@ local Executor = {name="Unknown", version="?", os="unknown", confidence="low", e
 local function detectExecutor()
     local i = {name="Unknown", version="?", os="unknown", confidence="low", evidence={}}
     if type(identifyexecutor) == "function" then
-        local n, v = identifyexecutor()
-        if type(n) == "string" then i.name, i.version, i.confidence = n, tostring(v or "?"), "high"
-            table.insert(i.evidence, "identifyexecutor() -> " .. n) end
+        local ok, n, v = pcall(identifyexecutor)
+        if ok and type(n) == "string" then
+            i.name, i.version, i.confidence = n, tostring(v or "?"), "high"
+            table.insert(i.evidence, "identifyexecutor() -> " .. n)
+        elseif not ok then
+            table.insert(i.evidence, "identifyexecutor() failed; using fallback detection")
+        end
     end
     if i.name == "Unknown" and type(getexecutorname) == "function" then
         local n = safe(getexecutorname)
         if type(n) == "string" then i.name, i.confidence = n, "high"
             table.insert(i.evidence, "getexecutorname() -> " .. n) end
     end
-    local genv = type(getgenv) == "function" and safe(getgenv) or {}
+    local genv = globalEnv or {}
     for _, s in ipairs({
         {"Opiumware", function() return opiumware ~= nil or (genv and genv.Opiumware) end},
         {"MacSploit", function() return macsploit ~= nil end},
@@ -118,12 +162,31 @@ local function runCompat()
             return #list > 0, "count=" .. #list
         end},
         {"file I/O", "file", 4, function()
-            if type(readfile) ~= "function" or type(writefile) ~= "function" then return false, "missing" end
-            local p = "ACProbe_v7.tmp"; local c = "t" .. math.random(1e7)
-            if not pcall(writefile, p, c) then return false, "write threw" end
+            if type(readfile) ~= "function" or type(writefile) ~= "function" then return false, "missing read/write" end
+            if type(isfile) ~= "function" then return false, "isfile unavailable; safe file test skipped" end
+            local p
+            for attempt = 1, 5 do
+                local candidate = string.format("ACProbe_v%d_compat_%d_%d_%d.tmp",
+                    SCHEMA, os.time(), math.random(1, 1000000000), attempt)
+                local exists = safe(isfile, candidate)
+                if exists == false then p = candidate; break end
+            end
+            if not p then return false, "could not reserve a unique temporary path" end
+            local c = "t" .. math.random(1, 1000000000)
+            local writeOk = pcall(writefile, p, c)
+            if not writeOk then
+                if type(delfile) == "function" and safe(isfile, p) == true then pcall(delfile, p) end
+                return false, "write threw"
+            end
             local rb = safe(readfile, p)
-            if type(delfile) == "function" then pcall(delfile, p) end
-            return rb == c, rb == c and "roundtrip ok" or "mismatch"
+            local cleaned = false
+            if type(delfile) == "function" and safe(isfile, p) == true then
+                pcall(delfile, p)
+                cleaned = safe(isfile, p) == false
+            end
+            if rb ~= c then return false, "mismatch" end
+            return true, cleaned and "roundtrip ok; temporary file removed"
+                or "roundtrip ok; unique temporary file remains"
         end},
         {"decompile", "script", 3, function()
             if type(decompile) ~= "function" then return false, "missing" end
@@ -204,8 +267,8 @@ local function runSUNC()
 end
 
 -- ============================================================
--- NEW: Known AC fingerprint database
--- Each entry: markers are weighted; >=80% match = high confidence
+-- Candidate fingerprints use equal-weight keyword markers. Coverage is a heuristic, not identification.
+-- High: >=80% with at least 3 hits. Medium: >=50% with at least 2 hits.
 -- ============================================================
 local FingerprintDB = {
     known = {
@@ -220,8 +283,6 @@ local FingerprintDB = {
              {kind="script", kw="byfron"},
              {kind="script", kw="hyperion"},
          },
-         expectedOutcomes={"no client recovery — enforcement is process-level"},
-         recommendation="Hyperion is process-level, not a client hook. Client-side hook detection is likely. Use data-only approach; avoid hookfunction on game metatables if not required.",
         },
         {name="Krampus", type="client-side hook", approach="metatable + server",
          markers={
@@ -231,8 +292,6 @@ local FingerprintDB = {
              {kind="remote", kw="detection"},
              {kind="remote", kw="sentry"},
          },
-         expectedOutcomes={"WalkSpeed reset", "teleport back", "kick at high threshold"},
-         recommendation="Krampus watches __namecall and __index. Avoid modifying metatables, or use hookmetamethod with clean upvalue names. Movement is validated server-side.",
         },
         {name="Adonis AC (common)", type="client observer", approach="player-moderated",
          markers={
@@ -241,8 +300,6 @@ local FingerprintDB = {
              {kind="remote", kw="report"},
              {kind="remote", kw="exploiter"},
          },
-         expectedOutcomes={"GUI warning sent to admins", "no immediate client reaction"},
-         recommendation="Adonis is detection + report, no automatic client action. Findings are logged to admins. Don't escalate — assume every flag is visible to staff.",
         },
         {name="UMG / Universal Moderation Guard", type="client observer + report",
          approach="player-moderated",
@@ -252,8 +309,6 @@ local FingerprintDB = {
              {kind="remote", kw="moderat"},
              {kind="source", kw="violation"},
          },
-         expectedOutcomes={"admin GUI", "player kick by human admin"},
-         recommendation="Human-moderated. Findings trigger admin notification, not client recovery. Assume all detection is visible to staff.",
         },
         {name="AA / Anti-Anticheat (custom)", type="client-side hook",
          approach="movement + integrity",
@@ -263,8 +318,6 @@ local FingerprintDB = {
              {kind="remote", kw="anticheat"},
              {kind="remote", kw="check"},
          },
-         expectedOutcomes={"WalkSpeed reset", "position revert", "report"},
-         recommendation="Custom Luau AC. Usually movement-focused. Probe thresholds incrementally: WS 20, 24, 28, 30, 32. Stop at first kick.",
         },
         {name="Sirhurt-Internal", type="client-side hook + kick",
          approach="detect exploit globals",
@@ -273,8 +326,6 @@ local FingerprintDB = {
              {kind="source", kw="sirhurt"},
              {kind="source", kw="injectdetect"},
          },
-         expectedOutcomes={"immediate kick"},
-         recommendation="Detects injected executor globals. Set getgenv()['namecall'] to nil before probing. Do not hook __namecall while this is loaded.",
         },
         {name="Generic Luau AC (movement)", type="client-side hook",
          approach="movement + physics validation",
@@ -285,8 +336,6 @@ local FingerprintDB = {
              {kind="remote", kw="position"},
              {kind="remote", kw="check"},
          },
-         expectedOutcomes={"reset", "revert"},
-         recommendation="Movement-focused. Validate: is client WS reset immediately or on server tick? If immediate, it's a client observer; if delayed, server-side.",
         },
         {name="Generic Luau AC (integrity)", type="client-side hook",
          approach="script integrity + GC scan",
@@ -296,8 +345,6 @@ local FingerprintDB = {
              {kind="source", kw="getloadedmodules"},
              {kind="remote", kw="module"},
          },
-         expectedOutcomes={"kick", "report"},
-         recommendation="GC scans for injected functions. Avoid leaving references in GC. Use newcclosure and clear references after use.",
         },
         {name="Custom remote validator", type="server-side",
          approach="server-only, no client observer",
@@ -307,8 +354,6 @@ local FingerprintDB = {
              {kind="remote", kw="check"},
              {kind="remote", kw="state"},
          },
-         expectedOutcomes={"server rejects, teleports back"},
-         recommendation="No client observer. Server-side only. Hook detection is not the issue — argument validation is. Match expected argument shape exactly.",
         },
     },
 }
@@ -360,7 +405,7 @@ local function classifyFingerprint()
             local ratio = matched / total
             table.insert(Fingerprint.matches, {
                 name=fp.name, matched=matched, total=total, ratio=ratio,
-                hits=hits, fp=fp,
+                hits=hits,
             })
         end
     end
@@ -372,7 +417,7 @@ local function classifyFingerprint()
         local top = Fingerprint.matches[1]
         if top.ratio >= 0.8 and top.matched >= 3 then
             Fingerprint.primary = top
-            Fingerprint.confidence = "medium"
+            Fingerprint.confidence = "high"
         elseif top.ratio >= 0.5 and top.matched >= 2 then
             Fingerprint.primary = top
             Fingerprint.confidence = "medium"
@@ -381,7 +426,7 @@ local function classifyFingerprint()
 end
 
 -- ============================================================
--- NEW: Stealth check — is our hook detectable?
+-- Local hook visibility heuristics; these do not establish experience-side detection.
 -- ============================================================
 local Stealth = {tests = {}, score = 0, total = 0, detectable = false, findings = {}}
 
@@ -407,15 +452,15 @@ local function runStealth()
     local function add(name, ok, msg, weight)
         table.insert(Stealth.tests, {name=name, ok=ok, msg=msg, weight=weight})
     end
-    -- 1. Is our own hook a C closure?
+    -- 1. Inspect the current local __namecall implementation (heuristic only).
     local mt = features.getrawmetatable and safe(getrawmt, game) or nil
     if mt then
         local fn = rawget(mt, "__namecall")
         if typeof(fn) == "function" then
-            add("__namecall is C closure", isC(fn), isC(fn) and "clean" or "Lua — visible to AC via debug.getinfo", 3)
+            add("Current __namecall implementation", isC(fn), isC(fn) and "native function" or "Lua function; heuristic only", 3)
         end
     else
-        add("__namecall is C closure", false, "cannot inspect (getrawmetatable failed)", 3)
+        add("Current __namecall implementation", false, "cannot inspect (getrawmetatable failed)", 3)
     end
     -- 2. Do our upvalues reveal us?
     if mt then
@@ -429,40 +474,19 @@ local function runStealth()
                 if type(name) == "string" and name:lower():find("acprobe") then revealing = revealing + 1 end
                 i = i + 1
             end
-            add("upvalue names clean", revealing == 0, revealing == 0 and "no ACProbe-named upvalues" or (revealing .. " ACProbe-named upvalues visible"), 2)
+            add("local observer marker", revealing == 0, revealing == 0 and "marker not found" or (revealing .. " local marker(s) found"), 2)
         end
     end
     -- 3. Is the AC hooking debug.getinfo?
     if debug and type(debug.getinfo) == "function" then
         local clean = isC(debug.getinfo) or safe(iscclosure, debug.getinfo) == true
-        add("debug.getinfo clean", clean, clean and "C closure" or "Lua — likely AC hook", 3)
+        add("debug.getinfo implementation", clean, clean and "native function" or "Lua function; heuristic only", 3)
     end
     -- 4. Is the AC hooking checkcaller?
     if type(checkcaller) == "function" then
         local clean = isC(checkcaller)
-        add("checkcaller clean", clean, clean and "C closure" or "Lua — AC can subvert caller detection", 2)
+        add("checkcaller implementation", clean, clean and "native function" or "Lua function; heuristic only", 2)
     end
-    -- 5. Are we running at elevated thread identity?
-    local tid
-    if type(getthreadidentity) == "function" then tid = safe(getthreadidentity)
-    elseif type(getidentity) == "function" then tid = safe(getidentity) end
-    if tid then
-        add("thread identity", tid >= 7, "identity=" .. tostring(tid) .. (tid >= 7 and " (elevated, expected)" or " (low)"), 1)
-    end
-    -- 6. Is the AC watching __namecall upvalues?
-    if mt then
-        local fn = rawget(mt, "__namecall")
-        if typeof(fn) == "function" and not isC(fn) and debug and debug.getinfo then
-            local ok, info = pcall(debug.getinfo, fn, "S")
-            if ok and info and type(info.source) == "string" then
-                local acLike = info.source:lower():find("ac") or info.source:lower():find("guard")
-                add("hook source not AC-adjacent", not acLike,
-                    acLike and ("hook source is '" .. info.source .. "' — may be AC hook itself") or "hook source looks clean",
-                    3)
-            end
-        end
-    end
-
     Stealth.score, Stealth.total = 0, 0
     for _, t in ipairs(Stealth.tests) do
         Stealth.total = Stealth.total + t.weight
@@ -482,64 +506,87 @@ local currentSession = {
     compatScore=0, sUNC=sUNC.count .. "/" .. sUNC.total,
     findingCount=0, findingsByKey={}, scanComplete=false,
 }
+local shutdownRequested = false
 
 findings, findingsIndex = {}, {}
 local CATEGORIES = {"environment","hooks","remotes","scripts","character","attributes","connections","tags"}
 for _, c in ipairs(CATEGORIES) do findings[c] = {} end
 
 local Reputation = {entries = {}}
+local Baseline = {}  -- set of keys marked baseline (excluded from score)
+local SEV = {skip=0, ok=1, info=2, warn=3, fail=4}
+
 function Reputation.Get(key)
     local e = Reputation.entries[key]
     return e and e.class or "unknown"
 end
-function Reputation.Set(key, class, reason)
-    if class == "unknown" then Reputation.entries[key] = nil
-    else Reputation.entries[key] = {class=class, reason=reason or "", setAt=os.time()} end
-    local f = findingsIndex[key]
-    if f then
-        if class == "confirmed_ac" then f.weight = math.max(f.weight or 0, 20); f.level = "fail"
-        elseif class == "confirmed_benign" or class == "benign" then f.weight = 0
-        elseif class == "suspect" then f.weight = math.max(f.weight or 0, 5) end
+
+local function applyFindingState(e, key)
+    local weight = type(e.rawWeight) == "number" and e.rawWeight or (e.weight or 0)
+    local level = SEV[e.rawLevel] and e.rawLevel or (SEV[e.level] and e.level or "info")
+    local class = Reputation.Get(key)
+    if class == "confirmed_ac" then
+        weight, level = math.max(weight, 20), "fail"
+    elseif class == "confirmed_benign" or class == "benign" then
+        weight, level = 0, "ok"
+    elseif class == "suspect" then
+        weight = math.max(weight, 5)
+        if (SEV[level] or 0) < SEV.warn then level = "warn" end
     end
+    if Baseline[key] then weight = 0 end
+    e.weight, e.level = weight, level
+    local sessionFinding = currentSession.findingsByKey[key]
+    if sessionFinding then sessionFinding.weight, sessionFinding.level = weight, level end
 end
 
-local Baseline = {}  -- set of keys marked baseline (excluded from score)
-
-local SEV = {skip=0, ok=1, info=2, warn=3, fail=4}
+function Reputation.Set(key, class, reason)
+    local allowed = {suspect=true, confirmed_ac=true, confirmed_benign=true}
+    if class == "unknown" then
+        Reputation.entries[key] = nil
+    elseif allowed[class] then
+        Reputation.entries[key] = {class=class, reason=type(reason) == "string" and reason or "", setAt=os.time()}
+    else
+        return false
+    end
+    local finding = findingsIndex[key]
+    if finding then applyFindingState(finding, key) end
+    return true
+end
 
 local function push(cat, level, weight, text, extra)
     if not findings[cat] then findings[cat] = {} end
     local key = cat .. "|" .. text
-    local rep = Reputation.Get(key)
-    if rep == "confirmed_ac" then weight = math.max(weight or 0, 20); level = "fail"
-    elseif rep == "confirmed_benign" then weight = 0; level = "ok"
-    elseif rep == "benign" then weight = 0
-    elseif rep == "suspect" then weight = math.max(weight or 0, 5) end
-    if Baseline[key] then weight = 0 end
-
+    local observedWeight = type(weight) == "number" and weight or 0
+    local observedLevel = SEV[level] and level or "info"
     local e = findingsIndex[key]
     if e then
-        e.lastSeen = os.time(); e.count = e.count + 1
-        if weight > (e.weight or 0) then e.weight = weight end
-        if (SEV[level] or 0) > (SEV[e.level] or 0) then e.level = level end
+        e.lastSeen = os.time()
+        e.count = (e.count or 0) + 1
+        e.rawWeight = math.max(e.rawWeight or e.weight or 0, observedWeight)
+        if (SEV[observedLevel] or 0) > (SEV[e.rawLevel] or 0) then e.rawLevel = observedLevel end
         if not table.find(e.sessions, sessionId) then table.insert(e.sessions, sessionId) end
         if not table.find(e.accounts, currentSession.account) then table.insert(e.accounts, currentSession.account) end
+        if extra then
+            e.remoteName = e.remoteName or extra.remoteName
+            e.scriptPath = e.scriptPath or extra.scriptPath
+        end
     else
         e = {
-            key=key,
-            level=level, weight=weight or 0, text=text,
+            key=key, level=observedLevel, weight=observedWeight,
+            rawLevel=observedLevel, rawWeight=observedWeight, text=text,
             firstSeen=os.time(), lastSeen=os.time(), count=1,
             sessions={sessionId}, accounts={currentSession.account},
-            remoteName = extra and extra.remoteName or nil,
-            scriptPath = extra and extra.scriptPath or nil,
+            remoteName=extra and extra.remoteName or nil,
+            scriptPath=extra and extra.scriptPath or nil,
         }
         findingsIndex[key] = e
         table.insert(findings[cat], e)
         if #findings[cat] > 500 then
-            local r = table.remove(findings[cat], 1)
-            if r then findingsIndex[cat .. "|" .. r.text] = nil end
+            local removed = table.remove(findings[cat], 1)
+            if removed then findingsIndex[removed.key or (cat .. "|" .. removed.text)] = nil end
         end
     end
+    applyFindingState(e, key)
     currentSession.findingsByKey[key] = {level=e.level, weight=e.weight or 0, category=cat, text=text}
 end
 
@@ -550,8 +597,17 @@ local Outcomes, Arch
 
 local function getStoragePath()
     if storagePath then return storagePath end
-    if type(makefolder) == "function" and type(isfolder) == "function" then
-        if not isfolder(STORAGE_FOLDER) then pcall(makefolder, STORAGE_FOLDER) end
+    local folderReady = false
+    if type(isfolder) == "function" then
+        local ok, exists = pcall(isfolder, STORAGE_FOLDER)
+        folderReady = ok and exists == true
+        if not folderReady and type(makefolder) == "function" then
+            local made = pcall(makefolder, STORAGE_FOLDER)
+            local checked, existsAfter = pcall(isfolder, STORAGE_FOLDER)
+            folderReady = made and checked and existsAfter == true
+        end
+    end
+    if folderReady then
         storagePath = STORAGE_FOLDER .. "/" .. tostring(game.PlaceId) .. ".json"
     else
         storagePath = "ACProbe_" .. tostring(game.PlaceId) .. ".json"
@@ -566,7 +622,7 @@ local function buildSnapshot()
         for _, e in ipairs(findings[cat]) do
             table.insert(fs[cat], {
                 key=e.key or (cat .. "|" .. e.text),
-                level=e.level, weight=e.weight, text=e.text,
+                level=e.level, weight=e.weight, rawLevel=e.rawLevel, rawWeight=e.rawWeight, text=e.text,
                 firstSeen=e.firstSeen, lastSeen=e.lastSeen, count=e.count,
                 sessions=e.sessions, accounts=e.accounts,
                 remoteName=e.remoteName, scriptPath=e.scriptPath,
@@ -593,7 +649,7 @@ local function buildSnapshot()
         executor={name=Executor.name, version=Executor.version, os=Executor.os},
         compat={score=Compat.score, passed=Compat.passed, failed=Compat.failed},
         sUNC={count=sUNC.count, total=sUNC.total, missing=sUNC.missing},
-        stealth={score=Stealth.score, total=Stealth.total, tests=Stealth.tests},
+        hookChecks={score=Stealth.score, total=Stealth.total, tests=Stealth.tests},
         fingerprint=Fingerprint.primary and {name=Fingerprint.primary.name, ratio=Fingerprint.primary.ratio, hits=Fingerprint.primary.hits} or nil,
         sessions=hist, findings=fs, reputation=rep, baseline=base,
         outcomes=Outcomes.serialise(),
@@ -613,56 +669,137 @@ end
 local function persistLoad()
     if not features.file_io then return nil end
     local p = getStoragePath()
-    local ok, ex = pcall(isfile, p)
-    if not ok or not ex then return nil end
-    local okR, content = pcall(readfile, p)
-    if not okR or type(content) ~= "string" or content == "" then return nil end
-    local okD, data = pcall(HttpService.JSONDecode, HttpService, content)
-    if not okD or type(data) ~= "table" then return nil end
-    if data.placeId and data.placeId ~= game.PlaceId then return nil end
+    if type(isfile) ~= "function" then return nil end
+    local ok, exists = pcall(isfile, p)
+    if not ok or not exists then return nil end
+    local okRead, content = pcall(readfile, p)
+    if not okRead or type(content) ~= "string" or content == "" or #content > 2 * 1024 * 1024 then return nil end
+    local okDecode, data = pcall(HttpService.JSONDecode, HttpService, content)
+    if not okDecode or type(data) ~= "table" then return nil end
+    if data.schema ~= SCHEMA and data.schema ~= LEGACY_SCHEMA then return nil end
+    if data.placeId ~= game.PlaceId then return nil end
     return data
 end
 
 local function persistDelete()
-    if not features.file_io then return end
-    if type(delfile) == "function" then
-        local ok, ex = pcall(isfile, getStoragePath())
-        if ok and ex then pcall(delfile, getStoragePath()) end
+    if not features.file_io then return true end
+    if type(delfile) ~= "function" or type(isfile) ~= "function" then return false, "file deletion unavailable" end
+    local path = getStoragePath()
+    local ok, exists = pcall(isfile, path)
+    if not ok then return false, "could not check saved file" end
+    if not exists then return true end
+    local deleted, deleteErr = pcall(delfile, path)
+    if not deleted then return false, tostring(deleteErr) end
+    local checked, stillExists = pcall(isfile, path)
+    if not checked or stillExists then return false, "saved file still exists" end
+    return true
+end
+
+local function isFiniteNumber(value)
+    return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+end
+
+local function savedNumber(value, fallback, minValue, maxValue)
+    if not isFiniteNumber(value) then return fallback end
+    return math.max(minValue, math.min(maxValue, value))
+end
+
+local function savedStringList(value, maxItems, maxLength)
+    local out = {}
+    if type(value) ~= "table" then return out end
+    for i, item in ipairs(value) do
+        if i > maxItems then break end
+        if type(item) == "string" and #item <= maxLength then out[#out+1] = item end
     end
+    return out
 end
 
 local function mergeLoaded(loaded)
-    if type(loaded) ~= "table" then return 0, 0 end
+    if type(loaded) ~= "table" or (loaded.schema ~= SCHEMA and loaded.schema ~= LEGACY_SCHEMA)
+       or loaded.placeId ~= game.PlaceId then
+        return 0, 0
+    end
     local merged, sess = 0, 0
     if type(loaded.sessions) == "table" then
-        for _, s in ipairs(loaded.sessions) do
-            if s.id ~= sessionId then
-                if not s.endReason and not s.ended then s.endReason = "unknown" end
-                table.insert(sessionHistory, s); sess = sess + 1
+        local first = math.max(1, #loaded.sessions - 59)
+        for i = first, #loaded.sessions do
+            local s = loaded.sessions[i]
+            if type(s) == "table" and type(s.id) == "string" and #s.id <= 128 and s.id ~= sessionId then
+                local savedSession = {
+                    id=s.id,
+                    account=type(s.account) == "string" and s.account:sub(1, 64) or "?",
+                    userId=isFiniteNumber(s.userId) and s.userId or nil,
+                    placeId=game.PlaceId,
+                    started=savedNumber(s.started, os.time(), 0, 4102444800),
+                    executor=type(s.executor) == "string" and s.executor:sub(1, 100) or "Unknown",
+                    executorVersion=type(s.executorVersion) == "string" and s.executorVersion:sub(1, 100) or "?",
+                    os=type(s.os) == "string" and s.os:sub(1, 100) or "unknown",
+                    compatScore=savedNumber(s.compatScore, 0, 0, 100),
+                    sUNC=type(s.sUNC) == "string" and s.sUNC:sub(1, 32) or "?",
+                    findingCount=savedNumber(s.findingCount, 0, 0, 10000),
+                    scanComplete=s.scanComplete == true,
+                    endReason=type(s.endReason) == "string" and s.endReason:sub(1, 100) or nil,
+                    ended=isFiniteNumber(s.ended) and s.ended or nil,
+                    kickMessage=type(s.kickMessage) == "string" and s.kickMessage:sub(1, 500) or nil,
+                    findingsByKey={},
+                }
+                if not savedSession.endReason and not savedSession.ended then savedSession.endReason = "unknown" end
+                if type(s.findingsByKey) == "table" then
+                    local copied = 0
+                    for key, value in pairs(s.findingsByKey) do
+                        if copied >= 2000 then break end
+                        if type(key) == "string" and #key <= 4096 and type(value) == "table"
+                           and type(value.text) == "string" and #value.text <= 2048
+                           and type(value.category) == "string" and findings[value.category] then
+                            local level = SEV[value.level] and value.level or "info"
+                            savedSession.findingsByKey[key] = {
+                                level=level,
+                                weight=savedNumber(value.weight, 0, 0, 10000),
+                                category=value.category,
+                                text=value.text,
+                            }
+                            copied = copied + 1
+                        end
+                    end
+                end
+                table.insert(sessionHistory, savedSession)
+                sess = sess + 1
             end
         end
     end
+
     if type(loaded.findings) == "table" then
         for _, cat in ipairs(CATEGORIES) do
             local list = loaded.findings[cat]
             if type(list) == "table" then
-                for _, e in ipairs(list) do
-                    if type(e) == "table" and type(e.text) == "string" then
+                local startIndex = math.max(1, #list - 499)
+                for i = startIndex, #list do
+                    local e = list[i]
+                    if type(e) == "table" and type(e.text) == "string" and #e.text <= 2048 then
                         local key = cat .. "|" .. e.text
+                        local rawLevel = SEV[e.rawLevel] and e.rawLevel or (SEV[e.level] and e.level or "info")
+                        local rawWeight = savedNumber(e.rawWeight, savedNumber(e.weight, 0, 0, 10000), 0, 10000)
+                        local count = math.floor(savedNumber(e.count, 1, 1, 1000000))
                         local ex = findingsIndex[key]
                         if ex then
-                            ex.count = (ex.count or 1) + (e.count or 1) - 1
-                            if e.firstSeen and (not ex.firstSeen or e.firstSeen < ex.firstSeen) then ex.firstSeen = e.firstSeen end
-                            if e.lastSeen and (not ex.lastSeen or e.lastSeen > ex.lastSeen) then ex.lastSeen = e.lastSeen end
-                            if (e.weight or 0) > (ex.weight or 0) then ex.weight = e.weight end
-                            if (SEV[e.level] or 0) > (SEV[ex.level] or 0) then ex.level = e.level end
-                        else
+                            ex.count = math.min(1000000, (ex.count or 1) + count - 1)
+                            local firstSeen = savedNumber(e.firstSeen, ex.firstSeen, 0, 4102444800)
+                            local lastSeen = savedNumber(e.lastSeen, ex.lastSeen, 0, 4102444800)
+                            ex.firstSeen = math.min(ex.firstSeen or firstSeen, firstSeen)
+                            ex.lastSeen = math.max(ex.lastSeen or lastSeen, lastSeen)
+                            ex.rawWeight = math.max(ex.rawWeight or 0, rawWeight)
+                            if (SEV[rawLevel] or 0) > (SEV[ex.rawLevel] or 0) then ex.rawLevel = rawLevel end
+                        elseif #findings[cat] < 500 then
                             local entry = {
-                                key=key,
-                                level=e.level or "info", weight=e.weight or 0, text=e.text,
-                                firstSeen=e.firstSeen or os.time(), lastSeen=e.lastSeen or os.time(),
-                                count=e.count or 1, sessions=e.sessions or {}, accounts=e.accounts or {},
-                                remoteName=e.remoteName, scriptPath=e.scriptPath,
+                                key=key, level=rawLevel, weight=rawWeight,
+                                rawLevel=rawLevel, rawWeight=rawWeight, text=e.text,
+                                firstSeen=savedNumber(e.firstSeen, os.time(), 0, 4102444800),
+                                lastSeen=savedNumber(e.lastSeen, os.time(), 0, 4102444800),
+                                count=count,
+                                sessions=savedStringList(e.sessions, 60, 128),
+                                accounts=savedStringList(e.accounts, 60, 64),
+                                remoteName=type(e.remoteName) == "string" and e.remoteName:sub(1, 255) or nil,
+                                scriptPath=type(e.scriptPath) == "string" and e.scriptPath:sub(1, 1024) or nil,
                             }
                             findingsIndex[key] = entry
                             table.insert(findings[cat], entry)
@@ -673,21 +810,55 @@ local function mergeLoaded(loaded)
             end
         end
     end
+
     if type(loaded.reputation) == "table" then
-        for k, v in pairs(loaded.reputation) do Reputation.entries[k] = v end
+        for key, value in pairs(loaded.reputation) do
+            if type(key) == "string" and #key <= 4096 and type(value) == "table"
+               and (value.class == "suspect" or value.class == "confirmed_ac" or value.class == "confirmed_benign") then
+                Reputation.entries[key] = {
+                    class=value.class,
+                    reason=type(value.reason) == "string" and value.reason:sub(1, 500) or "",
+                    setAt=savedNumber(value.setAt, os.time(), 0, 4102444800),
+                }
+            end
+        end
     end
     if type(loaded.baseline) == "table" then
-        for k, v in pairs(loaded.baseline) do Baseline[k] = v end
+        for key, value in pairs(loaded.baseline) do
+            if type(key) == "string" and #key <= 4096 and value == true then Baseline[key] = true end
+        end
+    end
+    for _, cat in ipairs(CATEGORIES) do
+        for _, entry in ipairs(findings[cat]) do applyFindingState(entry, entry.key) end
+    end
+
+    if type(loaded.outcomes) == "table" and Outcomes then
+        local first = math.max(1, #loaded.outcomes - Outcomes.MAX + 1)
+        for i = first, #loaded.outcomes do
+            local outcome = loaded.outcomes[i]
+            if type(outcome) == "table" and type(outcome.remote) == "string"
+               and #outcome.remote <= 255 and type(outcome.consequences) == "table" then
+                local consequences = savedStringList(outcome.consequences, 16, 300)
+                if #consequences > 0 then
+                    table.insert(Outcomes.entries, {
+                        remote=outcome.remote,
+                        at=savedNumber(outcome.at, os.time(), 0, 4102444800),
+                        consequences=consequences,
+                    })
+                end
+            end
+        end
     end
     return merged, sess
 end
 
 -- ============================================================
--- NEW: Outcome tracer — what does the server do after a suspicious fire?
+-- Client-visible changes observed near name-matched calls; timing does not establish cause.
 -- ============================================================
 Outcomes = {
     entries = {},  -- array of {remote, at, deltas...}
-    active = {},   -- remoteName -> {startT, baseline, monitorThread}
+    active = {},   -- remoteName -> {startT, baseline, generation}
+    generation = 0,
     monitorSeconds = 4,
     MAX = 200,
 }
@@ -725,16 +896,19 @@ local function getCharSnapshot()
 end
 
 function Outcomes.startMonitor(remoteName)
-    if Outcomes.active[remoteName] then return end
+    if shutdownRequested or Outcomes.active[remoteName] then return end
     local base = getCharSnapshot()
     if not base then return end
-    Outcomes.active[remoteName] = {startT = os.clock(), baseline = base}
+    local generation = Outcomes.generation
+    Outcomes.active[remoteName] = {startT=os.clock(), baseline=base, generation=generation}
 
     task.spawn(function()
         local start = os.clock()
         local consequences = {}
-        while os.clock() - start < Outcomes.monitorSeconds do
+        while os.clock() - start < Outcomes.monitorSeconds
+           and not shutdownRequested and generation == Outcomes.generation do
             task.wait(0.2)
+            if shutdownRequested or generation ~= Outcomes.generation then break end
             local cur = getCharSnapshot()
             if not cur then
                 table.insert(consequences, "character removed")
@@ -762,27 +936,15 @@ function Outcomes.startMonitor(remoteName)
                 table.insert(consequences, string.format("PlayerGui %d→%d", base.guiCount, cur.guiCount))
             end
         end
-        Outcomes.active[remoteName] = nil
-        if #consequences > 0 then
+        local active = Outcomes.active[remoteName]
+        if active and active.generation == generation then Outcomes.active[remoteName] = nil end
+        if #consequences > 0 and not shutdownRequested and generation == Outcomes.generation then
             table.insert(Outcomes.entries, {
                 remote = remoteName, at = os.time(),
                 consequences = consequences,
             })
             if #Outcomes.entries > Outcomes.MAX then table.remove(Outcomes.entries, 1) end
-            -- Auto-attribute consequences as evidence
-            for _, c in ipairs(consequences) do
-                if c:find("teleport") then
-                    push("remotes", "fail", 15, string.format("OUTCOME: '%s' → %s", remoteName, c), {remoteName=remoteName})
-                elseif c:find("kick") then
-                    push("remotes", "fail", 20, string.format("OUTCOME: '%s' → %s", remoteName, c), {remoteName=remoteName})
-                elseif c:find("health dropped") or c:find("tool removed") then
-                    push("remotes", "fail", 10, string.format("OUTCOME: '%s' → %s", remoteName, c), {remoteName=remoteName})
-                elseif c:find("WalkSpeed") or c:find("JumpPower") or c:find("HipHeight") then
-                    push("remotes", "warn", 8, string.format("OUTCOME: '%s' → %s (movement reset)", remoteName, c), {remoteName=remoteName})
-                elseif c:find("gui changed") then
-                    push("remotes", "warn", 6, string.format("OUTCOME: '%s' → %s (warning GUI)", remoteName, c), {remoteName=remoteName})
-                end
-            end
+            -- Keep observations separate from findings: temporal proximity is not causation.
             saveNow()
         end
     end)
@@ -794,7 +956,7 @@ end
 local Profiler = {
     window = 60, stateWindow = 200,
     remotes = {}, states = {}, lastState = nil, installed = false, active = false,
-    hook = nil, original = nil, errors = 0,
+    detachFailed = false, hook = nil, original = nil, errors = 0,
 }
 
 local function getState()
@@ -903,7 +1065,7 @@ local function callstackTrace()
 end
 
 local function installProfilerHook()
-    if Profiler.installed then return end
+    if Profiler.installed or Profiler.detachFailed or shutdownRequested then return end
     if not features.getrawmetatable or not features.setreadonly or type(getnamecallmethod) ~= "function" then return end
     local ok, mt = pcall(getrawmt, game)
     if not ok or not mt then return end
@@ -935,21 +1097,30 @@ local function installProfilerHook()
     pcall(setreadonly, mt, true)
     if not assigned then return end
     Profiler.hook, Profiler.original = hook, old
-    Profiler.installed = true
+    Profiler.installed, Profiler.detachFailed = true, false
 end
 
 local function detachProfilerHook()
     Profiler.active = false
-    if not Profiler.installed then return true end
+    if not Profiler.installed then return not Profiler.detachFailed end
     local ok, mt = pcall(getrawmt, game)
-    if not ok or not mt or mt.__namecall ~= Profiler.hook then return false end
-    if not pcall(setreadonly, mt, false) then return false end
+    if not ok or not mt or mt.__namecall ~= Profiler.hook then
+        Profiler.detachFailed = true
+        return false
+    end
+    if not pcall(setreadonly, mt, false) then
+        Profiler.detachFailed = true
+        return false
+    end
     local restored = pcall(function() mt.__namecall = Profiler.original end)
-    pcall(setreadonly, mt, true)
+    local relocked = pcall(setreadonly, mt, true)
     if restored then
         Profiler.installed, Profiler.hook, Profiler.original = false, nil, nil
+        Profiler.detachFailed = not relocked
+        return relocked
     end
-    return restored
+    Profiler.detachFailed = true
+    return false
 end
 
 -- ============================================================
@@ -1030,9 +1201,9 @@ local function generateRecommendations()
         table.insert(Recommendations.items, {priority="info", text="No client-visible consequence was captured in the observation window. Server-side behavior is unknown."})
     end
 
-    -- From stealth
+    -- Local hook checks are diagnostic only; do not suggest concealing or bypassing them.
     if Stealth.total > 0 and (Stealth.score / Stealth.total) < 0.5 then
-        table.insert(Recommendations.items, {priority="warn", text="Stealth score " .. Stealth.score .. "/" .. Stealth.total .. " — your hook is likely visible to the AC. Reinstall hook with newcclosure and clean upvalue names."})
+        table.insert(Recommendations.items, {priority="warn", text="Local hook checks raised visibility flags. Pause Live and detach the observer; results cannot establish how an experience handles the hook."})
     end
 
     -- From architecture
@@ -1065,7 +1236,7 @@ local function generateRecommendations()
         end
     end
     if noiseCount >= 5 then
-        table.insert(Recommendations.items, {priority="info", text=noiseCount .. " single-observation findings. Consider marking cosmetic ones as baseline (click on Detection)."})
+        table.insert(Recommendations.items, {priority="info", text=noiseCount .. " single-observation findings. Shift-click a cosmetic Detection row to baseline it."})
     end
 
     -- Sort: fail > high > warn > info
@@ -1348,7 +1519,10 @@ local okP = pcall(function()
     if gethui then screenGui.Parent = gethui()
     else screenGui.Parent = game:GetService("CoreGui") end
 end)
-if not okP then screenGui.Parent = player:WaitForChild("PlayerGui") end
+if not okP then
+    local playerGui = player:FindFirstChildOfClass("PlayerGui")
+    if playerGui then screenGui.Parent = playerGui else return end
+end
 
 local main = Instance.new("Frame")
 main.Size = UDim2.new(0, 940, 0, 680)
@@ -1436,7 +1610,7 @@ tabLayout.FillDirection = Enum.FillDirection.Horizontal
 tabLayout.Padding = UDim.new(0, 3)
 tabLayout.Parent = tabBar
 
-local tabs = {"Recs","Overview","Changes","Outcomes","Detections","Probes","Live","Stealth","Test","Fingerprint"}
+local tabs = {"Recs","Overview","Changes","Outcomes","Detections","Probes","Live","Hook Checks","Test","Fingerprint"}
 local tabButtons, tabContents = {}, {}
 
 local contentHolder = Instance.new("Frame")
@@ -1507,7 +1681,7 @@ end
 
 local runBtn    = makeButton("Run All",   0.14, -2, Color3.fromRGB(40, 120, 80));  runBtn.Position    = UDim2.new(0,    0, 0, 0)
 local probeBtn  = makeButton("Probe",     0.11, -2, Color3.fromRGB(180, 120, 40)); probeBtn.Position  = UDim2.new(0.14, 2, 0, 0)
-local liveBtn   = makeButton("Live: Paused", 0.12, -2, Color3.fromRGB(45, 45, 55)); liveBtn.Position   = UDim2.new(0.25, 4, 0, 0)
+local liveBtn   = makeButton("Live: Off", 0.12, -2, Color3.fromRGB(45, 45, 55)); liveBtn.Position   = UDim2.new(0.25, 4, 0, 0)
 local exportBtn = makeButton("JSON",      0.10, -2, Color3.fromRGB(45, 100, 150));  exportBtn.Position = UDim2.new(0.37, 6, 0, 0)
 local wipeBtn   = makeButton("Wipe",      0.10, -2, Color3.fromRGB(100, 50, 50));   wipeBtn.Position   = UDim2.new(0.47, 8, 0, 0)
 local closeBtn  = makeButton("Close",     0.10, -2, Color3.fromRGB(120, 50, 50));   closeBtn.Position  = UDim2.new(0.88, 14, 0, 0)
@@ -1628,9 +1802,9 @@ local function renderRecommendations()
         addRow("Recs", lvl, r.text)
     end
     addHeader("Recs", "Quick actions")
-    addRow("Recs", "info", "→ Probe tab: click Probe to test state changes (restores saved properties)")
-    addRow("Recs", "info", "→ Stealth tab: verify your hook isn't visible before probing further")
-    addRow("Recs", "info", "→ Detections tab: click any finding to mark baseline/confirmed_ac")
+    addRow("Recs", "info", "→ Probe tab: authorized-only property tests with conditional cleanup")
+    addRow("Recs", "info", "→ Hook Checks tab: local results are heuristics, not assurance about detection")
+    addRow("Recs", "info", "→ Detections tab: click to cycle reputation; Shift-click to toggle baseline")
 end
 
 local function renderOverview()
@@ -1640,7 +1814,7 @@ local function renderOverview()
     threatFill.BackgroundColor3 = color
     threatLabel.Text = string.format("  Threat: %d / 100  —  %s", score, band)
     if Fingerprint.primary then
-        archLabel.Text = string.format("  Detected: %s (%s)  ·  Architecture: %s",
+        archLabel.Text = string.format("  Candidate: %s (%s heuristic confidence)  ·  Architecture: %s",
             Fingerprint.primary.name, Fingerprint.confidence, Arch.classification)
     else
         archLabel.Text = string.format("  Architecture: %s (%s confidence)", Arch.classification, Arch.confidence)
@@ -1738,7 +1912,7 @@ end
 local function renderOutcomes()
     addHeader("Outcomes", string.format("%d outcome(s) captured", #Outcomes.entries))
     if #Outcomes.entries == 0 then
-        addRow("Outcomes", "skip", "No outcomes yet — enable Live and let the AC react to normal play")
+        addRow("Outcomes", "skip", "No outcomes yet — enable Live only in an authorized test environment")
         addRow("Outcomes", "info", "Outcomes record client-visible changes near a remote call; cause is unknown.")
         addRow("Outcomes", "info", "Watch for: teleport-back, WalkSpeed reset, HP drop, kick, GUI change.")
         return
@@ -1757,16 +1931,19 @@ end
 
 local renderAll
 local function renderDetections()
-    local cats = {"remotes", "connections", "attributes", "tags", "character", "environment"}
+    local cats = {"remotes", "hooks", "scripts", "connections", "attributes", "tags", "character", "environment"}
     local all = {}
     for _, cat in ipairs(cats) do
         for _, f in ipairs(findings[cat] or {}) do
-            if f.level == "warn" or f.level == "fail" then all[#all+1] = {cat=cat, f=f} end
+            local key = f.key or (cat .. "|" .. f.text)
+            if f.level == "warn" or f.level == "fail" or Reputation.Get(key) == "confirmed_benign" then
+                all[#all+1] = {cat=cat, f=f}
+            end
         end
     end
     table.sort(all, function(a, b) return (a.f.weight or 0) > (b.f.weight or 0) end)
 
-    addHeader("Detections", string.format("%d active (click to cycle reputation)", #all))
+    addHeader("Detections", string.format("%d reviewable · click: reputation, Shift-click: baseline", #all))
     if #all == 0 then addRow("Detections", "ok", "No active detections"); return end
     for i = 1, math.min(60, #all) do
         local it = all[i]
@@ -1778,19 +1955,23 @@ local function renderDetections()
         if base then tag = tag .. "[baseline] " end
         addRow("Detections", it.f.level, tag .. "[" .. it.cat .. "] " .. it.f.text, entryMeta(it.f),
             function()
-                -- Cycle: unknown → baseline → suspect → confirmed_ac → confirmed_benign → unknown
-                local cur = Reputation.Get(key)
-                if Baseline[key] then
-                    Baseline[key] = nil
-                    Reputation.Set(key, "suspect", "unbaselined")
+                local shiftDown = safe(function()
+                    return UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+                        or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+                end) == true
+                if shiftDown then
+                    Baseline[key] = not Baseline[key] or nil
+                    local finding = findingsIndex[key]
+                    if finding then applyFindingState(finding, key) end
                 else
+                    local cur = Reputation.Get(key)
                     local nxt = cur == "unknown" and "suspect"
                         or cur == "suspect" and "confirmed_ac"
                         or cur == "confirmed_ac" and "confirmed_benign"
                         or "unknown"
-                    if nxt == "unknown" then Reputation.Set(key, "unknown") end
-                    if nxt ~= "unknown" then Reputation.Set(key, nxt) end
+                    Reputation.Set(key, nxt)
                 end
+                saveNow()
                 renderAll()
             end)
     end
@@ -1802,24 +1983,28 @@ local function renderDetections()
 end
 
 local function renderProbes()
-    addHeader("Probes", "Controlled state-change tests (auto-revert)")
+    addHeader("Probes", "Temporary property tests (conditional cleanup)")
     if #AutoProbe.results == 0 then
-        addRow("Probes", "skip", "No probes run yet — click Probe button")
-        addRow("Probes", "info", "Each probe: set state → wait 2s → observe → revert")
-        addRow("Probes", "info", "Remote counts are observations; unrelated events can occur during a probe.")
+        addRow("Probes", "skip", "No probes run yet — click Probe twice within 5 seconds to confirm")
+        addRow("Probes", "warn", "Use only in an experience you own or are authorized to test.")
+        addRow("Probes", "info", "Temporary local state changes are restored only if the value was not changed independently.")
+        addRow("Probes", "info", "Remote calls in the observation window are not attributed to the state change.")
         return
     end
     for _, r in ipairs(AutoProbe.results) do
         local lvl = (r.level == "warn" and "warn") or (r.level == "fail" and "fail")
-                    or (r.level == "skip" and "skip") or "ok"
+                    or (r.level == "skip" and "skip") or (r.level == "info" and "info") or "ok"
         addRow("Probes", lvl, r.name .. " — " .. (r.msg or ""))
     end
+    addRow("Probes", "info", "Remote-call timing is observational, not evidence of causation.")
 end
 
 local function renderLive()
     addHeader("Live", "Behavioral profiles + callstack")
+    local hookStatus = Profiler.detachFailed and "detach failed; observer inactive"
+        or (Profiler.installed and "attached" or "not installed")
     addRow("Live", "info", string.format("Hook: %s · recording: %s · profiler errors: %d",
-        Profiler.installed and "attached" or "unavailable", Profiler.active and "on" or "paused", Profiler.errors))
+        hookStatus, Profiler.active and "on" or "paused", Profiler.errors))
     local sorted = {}
     for _, p in pairs(Profiler.remotes) do if p.calls >= 1 then sorted[#sorted+1] = p end end
     table.sort(sorted, function(a, b) return a.calls > b.calls end)
@@ -1847,21 +2032,19 @@ local function renderLive()
 end
 
 local function renderStealth()
-    addHeader("Stealth", string.format("Local checks: %d/%d — %s",
-        Stealth.score, Stealth.total,
-        (Stealth.total > 0 and Stealth.score / Stealth.total >= 0.7) and "few flags" or "review flags"))
+    addHeader("Hook Checks", string.format("Local heuristics: %d/%d passed",
+        Stealth.score, Stealth.total))
     if #Stealth.tests == 0 then
-        addRow("Stealth", "skip", "No stealth tests run")
+        addRow("Hook Checks", "skip", "No local hook checks available")
         return
     end
     for _, t in ipairs(Stealth.tests) do
-        addRow("Stealth", t.ok and "ok" or (t.weight >= 3 and "fail" or "warn"),
+        addRow("Hook Checks", t.ok and "ok" or (t.weight >= 3 and "warn" or "info"),
             string.format("[w%d] %s — %s", t.weight, t.name, t.msg))
     end
-    addHeader("Stealth", "Why this matters")
-    addRow("Stealth", "info", "If __namecall is a Lua function with ACProbe-named upvalues,")
-    addRow("Stealth", "info", "the AC can identify and target your hook.")
-    addRow("Stealth", "info", "These checks do not establish whether a game detects the hook.")
+    addHeader("Hook Checks", "Interpretation")
+    addRow("Hook Checks", "info", "These report local function properties only; they do not predict experience-side detection.")
+    addRow("Hook Checks", "info", "Live installs a temporary local observer. Pause Live to stop recording and attempt to detach it.")
 end
 
 local function renderTest()
@@ -1882,13 +2065,13 @@ local function renderTest()
 end
 
 local function renderFingerprint()
-    addHeader("Fingerprint", "Candidate matches (name and keyword markers)")
+    addHeader("Fingerprint", "Candidate matches; coverage is not proof of identity")
     if #Fingerprint.matches == 0 then
         addRow("Fingerprint", "skip", "No fingerprint matches yet — run Run All first")
         return
     end
     for _, m in ipairs(Fingerprint.matches) do
-        local lvl = m.ratio >= 0.8 and "fail" or (m.ratio >= 0.5 and "warn" or "info")
+        local lvl = m.ratio >= 0.5 and "warn" or "info"
         addRow("Fingerprint", lvl,
             string.format("%s — %d/%d markers (%.0f%%)", m.name, m.matched, m.total, m.ratio*100))
         for _, hit in ipairs(m.hits) do
@@ -1921,142 +2104,139 @@ renderAll = function()
 end
 
 -- ============================================================
--- AutoProbe (safe defaults; risky probes stay disabled unless toggled)
+-- AutoProbe (explicitly confirmed, cancellable, conditional cleanup)
 -- ============================================================
-AutoProbe = {results = {}, running = false, riskyEnabled = false}
+AutoProbe = {results = {}, running = false, cancelRequested = false}
 
 local function snapshotCounts()
-    local c = {}
-    for name, p in pairs(Profiler.remotes) do c[name] = p.calls end
-    return c
+    local counts = {}
+    for name, profile in pairs(Profiler.remotes) do counts[name] = profile.calls end
+    return counts
 end
 
-local function probeOne(name, setup, teardown, waitSec, risky)
-    if risky and not AutoProbe.riskyEnabled then
-        return {name=name, level="skip", msg="risky (disabled)"}
+local function probeOne(name, setup, teardown, waitSec)
+    if shutdownRequested or AutoProbe.cancelRequested then
+        return {name=name, level="skip", msg="cancelled before start"}
     end
     local before = snapshotCounts()
-    local okS, errS = pcall(setup)
-    if not okS then
-        local restored, restoreErr = pcall(teardown)
-        return {name=name, level="fail", msg="setup: " .. tostring(errS) ..
-            (restored and " (restored)" or ("; restore: " .. tostring(restoreErr)))}
+    local setupOk, setupErr = pcall(setup)
+    local cancelled = false
+    if setupOk then
+        local startedAt = os.clock()
+        while os.clock() - startedAt < (waitSec or 2) do
+            if shutdownRequested or AutoProbe.cancelRequested then
+                cancelled = true
+                break
+            end
+            task.wait(0.05)
+        end
     end
-    local t0 = os.clock()
-    while os.clock() - t0 < (waitSec or 2) do task.wait(0.05) end
     local after = snapshotCounts()
-    local restored, restoreErr = pcall(teardown)
-    local fired = {}
-    for rn, c in pairs(after) do
-        if c > (before[rn] or 0) then fired[rn] = c - (before[rn] or 0) end
+    -- Always run cleanup, including after setup errors and close/cancel requests.
+    local cleanupCallOk, cleanupResult, cleanupDetail = pcall(teardown)
+    local cleanupOk = cleanupCallOk and cleanupResult ~= false
+    if not cleanupCallOk then cleanupDetail = tostring(cleanupResult) end
+
+    local observed = {}
+    for remoteName, calls in pairs(after) do
+        local delta = calls - (before[remoteName] or 0)
+        if delta > 0 then observed[remoteName] = delta end
     end
-    local summary = {}
-    for rn, c in pairs(fired) do table.insert(summary, rn .. "(" .. c .. ")") end
+    local summary, count = {}, 0
+    for remoteName, calls in pairs(observed) do
+        summary[#summary+1] = remoteName .. "(" .. calls .. ")"
+        count = count + calls
+    end
     table.sort(summary)
-    local count = 0
-    for _, c in pairs(fired) do count = count + c end
-    return {
-        name=name, level=not restored and "fail" or (count > 0 and "warn" or "ok"),
-        msg=(count > 0 and ("remotes: " .. table.concat(summary, ", ")) or "no remotes observed") ..
-            (restored and "" or ("; restore failed: " .. tostring(restoreErr))),
-        fired=fired, count=count, risky=risky,
-    }
+
+    local level, message
+    if not setupOk then
+        level, message = "fail", "setup failed: " .. tostring(setupErr)
+    elseif not cleanupOk then
+        level, message = "fail", "cleanup failed: " .. tostring(cleanupDetail or "unknown error")
+    elseif cancelled then
+        level, message = "skip", "cancelled; cleanup completed"
+    else
+        level = count > 0 and "info" or "ok"
+        message = count > 0
+            and ("remote calls during observation window (not attributed): " .. table.concat(summary, ", "))
+            or "no remote calls observed during window"
+    end
+    if not cleanupOk and not setupOk then message = message .. "; cleanup failed: " .. tostring(cleanupDetail or "unknown error") end
+    if cleanupOk and type(cleanupDetail) == "string" then message = message .. "; " .. cleanupDetail end
+    return {name=name, level=level, msg=message, observed=observed, count=count, cancelled=cancelled}
+end
+
+local function runPropertyProbe(name, char, target, property, transform, waitSec)
+    local original, probeValue, applied
+    return probeOne(name, function()
+        if not char.Parent or player.Character ~= char or target.Parent ~= char then
+            error("character changed before probe")
+        end
+        original = target[property]
+        probeValue = transform(original)
+        applied = true
+        target[property] = probeValue
+    end, function()
+        if not applied then return true end
+        if not char.Parent or player.Character ~= char or target.Parent ~= char then
+            return true, "character changed; old object left untouched"
+        end
+        local readOk, current = pcall(function() return target[property] end)
+        if not readOk then return false, "could not read value during cleanup" end
+        if current ~= probeValue then return true, "value changed independently; preserved" end
+        local restoreOk, restoreErr = pcall(function() target[property] = original end)
+        if not restoreOk then return false, tostring(restoreErr) end
+        return true
+    end, waitSec)
 end
 
 local function runAutoProbes()
-    if AutoProbe.running then return end
+    if AutoProbe.running or shutdownRequested then return end
     AutoProbe.running = true
+    AutoProbe.cancelRequested = false
     AutoProbe.results = {}
-    titleLabel.Text = "  Antichat Probe v7 — probing (state changes auto-revert)..."
+    titleLabel.Text = "  Anticheat Probe v7 — probing authorized test state..."
 
-    local char = player.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hum or not hrp then
-        table.insert(AutoProbe.results, {name="init", level="fail", msg="no character"})
-        AutoProbe.running = false; renderAll(); return
-    end
-    local baseWS, baseJP, baseHH = hum.WalkSpeed, hum.JumpPower, hum.HipHeight or 0
-    local baseCF = hrp.CFrame
-
-    local p1 = probeOne("WalkSpeed +20%",
-        function() hum.WalkSpeed = baseWS * 1.2 end,
-        function() hum.WalkSpeed = baseWS end, 2, false)
-    table.insert(AutoProbe.results, p1)
-    if p1.count and p1.count > 0 then
-        for rn in pairs(p1.fired) do
-            push("remotes", "warn", 6, string.format("Probe: '%s' fired on WalkSpeed change", rn), {remoteName=rn})
+    local runOk, runErr = pcall(function()
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not char or not hum or not hrp then
+            table.insert(AutoProbe.results, {name="init", level="fail", msg="no character"})
+            return
         end
-    end
-    task.wait(0.5)
-
-    local p2 = probeOne("JumpPower +50%",
-        function() hum.JumpPower = baseJP * 1.5 end,
-        function() hum.JumpPower = baseJP end, 2, false)
-    table.insert(AutoProbe.results, p2)
-    if p2.count and p2.count > 0 then
-        for rn in pairs(p2.fired) do
-            push("remotes", "warn", 6, string.format("Probe: '%s' fired on JumpPower change", rn), {remoteName=rn})
-        end
-    end
-    task.wait(0.5)
-
-    local p3 = probeOne("HipHeight +3",
-        function() hum.HipHeight = baseHH + 3 end,
-        function() hum.HipHeight = baseHH end, 2, false)
-    table.insert(AutoProbe.results, p3)
-    if p3.count and p3.count > 0 then
-        for rn in pairs(p3.fired) do
-            push("remotes", "warn", 6, string.format("Probe: '%s' fired on HipHeight change", rn), {remoteName=rn})
-        end
-    end
-    task.wait(0.5)
-
-    local p4 = probeOne("Position +10 studs X",
-        function() hrp.CFrame = baseCF + Vector3.new(10, 0, 0) end,
-        function() if hrp and hrp.Parent then hrp.CFrame = baseCF end end, 2, false)
-    table.insert(AutoProbe.results, p4)
-    if p4.count and p4.count > 0 then
-        for rn in pairs(p4.fired) do
-            push("remotes", "warn", 6, string.format("Probe: '%s' fired on position shift", rn), {remoteName=rn})
-        end
-    end
-    task.wait(0.5)
-
-    if AutoProbe.riskyEnabled then
-        local originalCollision = {}
-        local p5 = probeOne("Noclip 2s",
-            function()
-                for _, d in ipairs(char:GetDescendants()) do
-                    if d:IsA("BasePart") then
-                        originalCollision[d] = d.CanCollide
-                        d.CanCollide = false
-                    end
-                end
-            end,
-            function()
-                for part, original in pairs(originalCollision) do
-                    if part.Parent then part.CanCollide = original end
-                end
-            end, 2, true)
-        table.insert(AutoProbe.results, p5)
-        if p5.count and p5.count > 0 then
-            for rn in pairs(p5.fired) do
-                push("remotes", "warn", 6, string.format("Probe: '%s' fired on noclip", rn), {remoteName=rn})
+        local probesToRun = {
+            function() return runPropertyProbe("WalkSpeed +20%", char, hum, "WalkSpeed", function(value) return value * 1.2 end, 2) end,
+            function() return runPropertyProbe("JumpPower +50%", char, hum, "JumpPower", function(value) return value * 1.5 end, 2) end,
+            function() return runPropertyProbe("HipHeight +3", char, hum, "HipHeight", function(value) return value + 3 end, 2) end,
+        }
+        for index, runProbe in ipairs(probesToRun) do
+            if shutdownRequested or AutoProbe.cancelRequested then break end
+            if not char.Parent or player.Character ~= char then
+                table.insert(AutoProbe.results, {name="remaining probes", level="skip", msg="character changed; sequence stopped"})
+                break
             end
+            table.insert(AutoProbe.results, runProbe())
+            if index < #probesToRun and not shutdownRequested and not AutoProbe.cancelRequested then task.wait(0.5) end
         end
+    end)
+    if not runOk then
+        table.insert(AutoProbe.results, {name="runner", level="fail", msg=tostring(runErr)})
     end
-
-    saveNow()
-    renderAll()
-    titleLabel.Text = "  Anticheat Probe v7"
     AutoProbe.running = false
+    if not shutdownRequested then
+        saveNow()
+        renderAll()
+        titleLabel.Text = "  Anticheat Probe v7"
+    end
 end
 
 -- ============================================================
 -- Runner + Live + Buttons
 -- ============================================================
 local running = false
+local startupRunning = false
 local probes = {
     {"hooks", probe_hooks}, {"remotes", probe_remotes}, {"scripts", probe_scripts},
     {"character", probe_character}, {"attributes", probe_attributes},
@@ -2065,10 +2245,12 @@ local probes = {
 }
 
 local function runAll()
-    if running then return end
+    if running or shutdownRequested then return end
     running = true
+    currentSession.scanComplete = false
     local scanOk = true
     for i, p in ipairs(probes) do
+        if shutdownRequested then scanOk = false; break end
         titleLabel.Text = string.format("  Anticheat Probe v7 — %d/%d: %s", i, #probes, p[1])
         local ok, err = pcall(p[2])
         if not ok then
@@ -2078,51 +2260,77 @@ local function runAll()
         saveNow()
         task.wait()
     end
+    running = false
     currentSession.scanComplete = scanOk
+    if shutdownRequested then return end
     runStealth()
     saveNow()
     renderAll()
     titleLabel.Text = "  Anticheat Probe v7"
-    running = false
 end
 
 local liveOn = false
 local function startLive()
-    if liveOn then return end
+    if liveOn or shutdownRequested then return false end
+    if Profiler.detachFailed then
+        liveBtn.Text = "Detach failed"
+        return false
+    end
     installProfilerHook()
     if not Profiler.installed then
         liveBtn.Text = "Hook unavailable"
-        return
+        return false
     end
     liveOn = true
     Profiler.active = true
     snapState()
     task.spawn(function()
-        while liveOn do
+        while liveOn and not shutdownRequested do
             snapState()
-            if not Profiler.installed then installProfilerHook() end
             renderAll()
             task.wait(2)
         end
     end)
     liveBtn.Text = "Live: On"
     liveBtn.BackgroundColor3 = Color3.fromRGB(40, 120, 80)
+    return true
 end
 local function stopLive()
     liveOn = false
     Profiler.active = false
-    liveBtn.Text = "Live: Paused"
-    liveBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    local detached = detachProfilerHook()
+    liveBtn.Text = detached and "Live: Paused" or "Detach failed"
+    liveBtn.BackgroundColor3 = detached and Color3.fromRGB(45, 45, 55) or Color3.fromRGB(140, 65, 45)
+    return detached
 end
 
 runBtn.MouseButton1Click:Connect(runAll)
+local probeArmedUntil, probeArmToken = 0, 0
 probeBtn.MouseButton1Click:Connect(function()
-    if AutoProbe.running then return end
-    if not liveOn then startLive() end
-    if not liveOn then return end
+    if AutoProbe.running or shutdownRequested then return end
+    if os.clock() > probeArmedUntil then
+        probeArmedUntil = os.clock() + 5
+        probeArmToken = probeArmToken + 1
+        local token = probeArmToken
+        probeBtn.Text = "Confirm?"
+        task.delay(5, function()
+            if token == probeArmToken and not AutoProbe.running and probeBtn.Parent then
+                probeArmedUntil = 0
+                probeBtn.Text = "Probe"
+            end
+        end)
+        return
+    end
+    probeArmedUntil = 0
+    probeArmToken = probeArmToken + 1
+    probeBtn.Text = "Probe"
+    if not liveOn and not startLive() then return end
     task.spawn(runAutoProbes)
 end)
-liveBtn.MouseButton1Click:Connect(function() if liveOn then stopLive() else startLive() end end)
+liveBtn.MouseButton1Click:Connect(function()
+    if shutdownRequested then return end
+    if liveOn then stopLive() else startLive() end
+end)
 exportBtn.MouseButton1Click:Connect(function()
     if not features.setclipboard then exportBtn.Text = "No clip"; task.wait(1); exportBtn.Text = "JSON"; return end
     local payload = buildSnapshot()
@@ -2135,7 +2343,8 @@ exportBtn.MouseButton1Click:Connect(function()
     payload.exportedAt = os.time()
     local ok, json = pcall(HttpService.JSONEncode, HttpService, payload)
     if not ok then exportBtn.Text = "Enc err"; task.wait(1); exportBtn.Text = "JSON"; return end
-    setclipboard(json)
+    local copied = pcall(setclipboard, json)
+    if not copied then exportBtn.Text = "Copy err"; task.wait(1); exportBtn.Text = "JSON"; return end
     exportBtn.Text = "Copied!"
     task.wait(1); exportBtn.Text = "JSON"
 end)
@@ -2146,25 +2355,65 @@ wipeBtn.MouseButton1Click:Connect(function()
     local conn
     conn = wipeBtn.MouseButton1Click:Connect(function()
         if not armed then return end
+        if running or AutoProbe.running or startupRunning then
+            armed = false; conn:Disconnect()
+            wipeBtn.Text = "Busy"
+            task.delay(1, function() if wipeBtn.Parent then wipeBtn.Text = "Wipe" end end)
+            return
+        end
         armed = false; conn:Disconnect()
-        persistDelete()
+        local hookDetached = true
+        if liveOn or Profiler.installed then hookDetached = stopLive() end
+        Outcomes.generation = Outcomes.generation + 1
+        Outcomes.active = {}
+        local fileDeleted = persistDelete()
         for _, c in ipairs(CATEGORIES) do
             for i = #findings[c], 1, -1 do findings[c][i] = nil end
         end
         findingsIndex = {}; sessionHistory = {}
         Reputation.entries = {}; Baseline = {}
-        Profiler.remotes = {}
-        Outcomes.entries = {}; AutoProbe.results = {}
+        currentSession.findingsByKey = {}
+        currentSession.findingCount = 0
+        currentSession.scanComplete = false
+        Profiler.remotes = {}; Profiler.states = {}; Profiler.lastState = nil
+        Outcomes.entries = {}; Outcomes.active = {}; AutoProbe.results = {}
         renderAll()
-        wipeBtn.Text = "Wiped"
+        wipeBtn.Text = fileDeleted and "Wiped" or "Memory only"
+        if not fileDeleted then
+            titleLabel.Text = "In-memory data cleared; saved file could not be deleted."
+        elseif not hookDetached then
+            titleLabel.Text = "History cleared; observer is inactive but could not be detached. Reload the client."
+        end
         task.wait(1); wipeBtn.Text = "Wipe"
     end)
 end)
+local closePending, closeAnywayAvailable = false, false
 closeBtn.MouseButton1Click:Connect(function()
-    stopLive()
-    saveNow()
-    if detachProfilerHook() and getgenv then getgenv().ACProbeV7Loaded = nil end
-    screenGui:Destroy()
+    if closePending then return end
+    if closeAnywayAvailable then
+        -- The observer is inactive, but another hook may have replaced our metatable entry.
+        -- Keep the load guard set so this session cannot stack another observer.
+        screenGui:Destroy()
+        return
+    end
+    closePending = true
+    shutdownRequested = true
+    AutoProbe.cancelRequested = true
+    closeBtn.Text = "Stopping..."
+    task.spawn(function()
+        while AutoProbe.running or running or startupRunning do task.wait(0.05) end
+        local detached = stopLive()
+        saveNow()
+        if not detached then
+            titleLabel.Text = "Could not detach the observer safely. Retry, or close anyway and reload the client."
+            closeBtn.Text = "Close anyway"
+            closeAnywayAvailable = true
+            closePending = false
+            return
+        end
+        clearLoadedGuard()
+        screenGui:Destroy()
+    end)
 end)
 
 -- ============================================================
@@ -2172,24 +2421,48 @@ end)
 -- ============================================================
 setTab("Recs")
 titleLabel.Text = "  Anticheat Probe v7 — compat test..."
+if type(globalEnv) == "table" then pcall(function() globalEnv.ACProbeV7Loaded = loadedMarker end) end
+startupRunning = true
 
 task.spawn(function()
-    runCompat()
-    runSUNC()
-    currentSession.compatScore = Compat.score
-    currentSession.sUNC = sUNC.count .. "/" .. sUNC.total
+    local startupOk, startupErr = pcall(function()
+        runCompat()
+        runSUNC()
+        currentSession.compatScore = Compat.score
+        currentSession.sUNC = sUNC.count .. "/" .. sUNC.total
 
-    local loaded = persistLoad()
-    local merged, sess = 0, 0
-    if loaded then merged, sess = mergeLoaded(loaded) end
+        local loaded = persistLoad()
+        local merged = 0
+        if loaded then merged = mergeLoaded(loaded) end
 
-    installProfilerHook()
-    runStealth()
-    renderAll()
+        -- The global observer hook is intentionally installed only after Live is enabled.
+        runStealth()
+        renderAll()
 
-    if merged > 0 then
-        titleLabel.Text = string.format("  Anticheat Probe v7 — resumed %d findings", merged)
-        task.wait(2)
+        if merged > 0 then
+            titleLabel.Text = string.format("  Anticheat Probe v7 — resumed %d findings", merged)
+            task.wait(2)
+        end
+        if not shutdownRequested then task.spawn(runAll) end
+    end)
+    startupRunning = false
+    if not startupOk then
+        shutdownRequested = true
+        AutoProbe.cancelRequested = true
+        closePending = true
+        titleLabel.Text = "  Anticheat Probe v7 — startup failed; see executor error output"
+        if type(warn) == "function" then pcall(warn, "Anticheat Probe startup failed: " .. tostring(startupErr)) end
+        task.spawn(function()
+            while AutoProbe.running or running do task.wait(0.05) end
+            if stopLive() then
+                clearLoadedGuard()
+                screenGui:Destroy()
+            else
+                titleLabel.Text = "Startup failed; observer could not be detached. Reload the client."
+                closeBtn.Text = "Close anyway"
+                closeAnywayAvailable = true
+                closePending = false
+            end
+        end)
     end
-    task.spawn(runAll)
 end)
